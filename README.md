@@ -1,212 +1,400 @@
-## Plan: Navidrome Uploader-Dashboard (Spring Boot)
+# Projektplan: Navidrome Music Uploader
 
-Basierend auf deinen Antworten: externe Metadatensuche, App auf separatem Host mit SFTP-Transfer, Thymeleaf+HTMX, Login gegen Navidrome.
+**Spring-Boot-Dashboard zum Suchen, Herunterladen und Einpflegen von Musik in eine bestehende Navidrome-Bibliothek**
 
----
-
-### 0. Scope-Abgrenzung (wichtig vorab)
-
-Die App **lädt keine Audiodateien aus dem Internet**. „Suche in externen Quellen" heißt: Metadaten-Recherche (MusicBrainz, Cover Art Archive) um Releases zu identifizieren, Tracklisten und Cover zu holen und deine Dateien sauber zu taggen. Die Audiodateien liefert der Nutzer per Browser-Upload.
+Stand: 18.09.2026 · Autor: Nico
 
 ---
 
-### 1. Requirements
+## 1. Ziel in einem Satz
 
-**Funktional**
-
-| ID | Anforderung | Akzeptanzkriterium |
-|---|---|---|
-| FR-1 | Login mit Navidrome-Zugangsdaten | Falsche Credentials → 401, keine Session; korrekte → Dashboard |
-| FR-2 | Suche nach Artist / Release / Track in MusicBrainz | Trefferliste mit Artist, Titel, Jahr, Format, Land |
-| FR-3 | Release-Detail mit Tracklist + Cover (CAA) | Tracknummern, Titel, Dauer, MBIDs, Coverbild |
-| FR-4 | Abgleich mit Bibliothek | Pro Treffer Badge „in Bibliothek" / „fehlt" via Subsonic `search3` |
-| FR-5 | Upload mehrerer Dateien (Drag & Drop) | Fortschrittsanzeige je Datei, erlaubte Formate konfigurierbar |
-| FR-6 | Tag-Zuordnung vor Transfer | Datei ↔ Track-Mapping vorschlagen, manuell korrigierbar; Tags werden geschrieben |
-| FR-7 | Zielpfad nach Namensschema | Vorschau des Zielpfads vor dem Transfer (Dry-Run) |
-| FR-8 | SFTP-Transfer mit Staging | Upload nach `.incoming/<job-id>/`, dann atomares Rename in die Library |
-| FR-9 | Scan-Trigger | Nach Job-Abschluss `startScan`, Status via `getScanStatus` pollen |
-| FR-10 | Job-Historie | Liste aller Uploads mit Status (QUEUED/RUNNING/DONE/FAILED), Fehlertext, Retry |
-| FR-11 | Kollisionsschutz | Existierende Zieldatei → Job stoppt und fragt (Skip / Ersetzen / Umbenennen) |
-
-**Nicht-funktional**
-
-- Upload-Jobs laufen asynchron und **neustart-fest** (Queue in DB, nicht im RAM)
-- Dateigrößen bis ~200 MB/Datei, ~2 GB/Job (FLAC-Alben)
-- Keine Klartext-Passwörter in DB oder Logs
-- MusicBrainz: max. 1 Request/Sekunde + Caching (harte API-Regel) + aussagekräftiger User-Agent
-- Audit: wer hat wann welche Datei wohin geschrieben
-- Deployment als Fat-JAR + systemd-Unit oder Docker-Image
+Ein selbst gehostetes Web-Dashboard, über das man — auch vom Smartphone, ohne lokale Dateien — einen Künstler/Album/Track sucht, per Klick einen Download-Job startet, und die Applikation lädt die Dateien über einen Soulseek-Client (slskd) herunter, taggt sie, legt sie korrekt benannt in der Navidrome-Bibliothek ab und stößt den Navidrome-Scan an.
 
 ---
 
-### 2. Architektur
+## 2. Bestätigte Entscheidungen
 
-```
-Browser (Thymeleaf + HTMX)
-        │ HTTPS, Session-Cookie
-┌───────▼──────────────────────────────────────────┐
-│ Spring Boot App (Host B)                         │
-│                                                  │
-│  web/        Controller, HTMX-Fragmente          │
-│  security/   SubsonicAuthenticationProvider      │
-│  metadata/   MusicBrainzClient, CoverArtClient   │
-│  library/    SubsonicClient (search3, scan)      │
-│  ingest/     TagWriter, PathResolver, JobService │
-│  transfer/   SftpTransferService                 │
-│  persistence/ JPA + Flyway                       │
-└──┬───────────────┬────────────────────┬──────────┘
-   │ HTTPS         │ HTTPS /rest/*      │ SSH/SFTP :22
-   ▼               ▼                    ▼
-MusicBrainz    Navidrome (Host A)   Musikordner (Host A)
-```
-
-**Upload-Sequenz**
-
-1. Browser → Multipart-Upload → temporäres Verzeichnis der App
-2. Validierung: Magic Bytes + Extension + Größe (nicht nur Content-Type vertrauen)
-3. Tags lesen (jaudiotagger), Vorschlag zum Mapping auf gewählten Release
-4. Nutzer bestätigt → Job wird als `QUEUED` persistiert, Request endet
-5. Worker: Tags schreiben → Zielpfad berechnen → SFTP nach `<musicdir>/.incoming/<jobId>/`
-6. Remote: `mkdir -p` Zielordner, dann `rename` innerhalb desselben Dateisystems → atomar, der Scanner sieht nie halbe Dateien
-7. `startScan` → `getScanStatus` pollen → Job `DONE`, HTMX-Polling aktualisiert die UI
-
-Warum `.incoming`: Navidrome ignoriert Ordner mit führendem Punkt. Das Staging-Verzeichnis **muss auf demselben Dateisystem** liegen wie die Library, sonst ist das Rename kein atomarer Syscall mehr.
-
----
-
-### 3. Tech-Stack
-
-| Baustein | Wahl | Begründung |
-|---|---|---|
-| Java | 21 (LTS) | breite Tool-Unterstützung; 25 möglich |
-| Spring Boot | 3.5.x | aktuell 3.5.16, kommerzieller Support bis 2032, größtes Ökosystem. Alternativ 4.1.x (seit Juni 2026 stabil) wenn du auf dem neuesten Stand bauen willst |
-| View | Thymeleaf + HTMX 2 (WebJar) + Bootstrap/Pico.css | kein Node-Build |
-| Persistenz | Spring Data JPA + H2 (file) oder PostgreSQL | H2 reicht für Single-User; Postgres wenn mehrere parallel arbeiten |
-| Migration | Flyway | |
-| SFTP | **sshj** (hierynomus) oder Apache MINA SSHD | JSch-Original ist tot — falls JSch, dann den `com.github.mwiede`-Fork |
-| Audio-Tags | jaudiotagger | FLAC/MP3/M4A/Ogg |
-| HTTP-Clients | `RestClient` + Resilience4j (RateLimiter, Retry, CircuitBreaker) | MusicBrainz-Limit |
-| Async | `@Async` + DB-Queue, oder Spring Batch bei mehr Komplexität | |
-| Tests | JUnit 5, Testcontainers (`atmoz/sftp`), WireMock, Mockito | SFTP echt testbar |
-
----
-
-### 4. Projekt-Setup (Schritt 1 der Umsetzung)
-
-```bash
-curl https://start.spring.io/starter.zip \
-  -d type=maven-project -d language=java -d javaVersion=21 \
-  -d bootVersion=3.5.16 \
-  -d groupId=de.nico -d artifactId=navidrome-uploader \
-  -d name=navidrome-uploader -d packageName=de.nico.uploader \
-  -d dependencies=web,thymeleaf,security,validation,data-jpa,flyway,actuator,h2,devtools \
-  -o navidrome-uploader.zip
-```
-
-Paketstruktur:
-
-```
-de.nico.uploader
-├── config/        SecurityConfig, SftpProperties, MusicBrainzProperties
-├── security/      SubsonicAuthenticationProvider, SubsonicUserDetails
-├── metadata/      MusicBrainzClient, CoverArtClient, dto/
-├── library/       NavidromeClient (search3, ping, getUser, startScan)
-├── ingest/        UploadController, StagingService, TagWriter, PathResolver
-├── transfer/      SftpTransferService, TransferWorker
-├── job/           UploadJob, UploadFile, JobRepository, JobService
-└── web/           DashboardController, fragments/
-```
-
----
-
-### 5. Datenmodell
-
-```
-upload_job(id, created_by, created_at, status, release_mbid, 
-           target_dir, error_message, scan_triggered_at)
-upload_file(id, job_id, original_filename, size_bytes, sha256,
-            track_mbid, target_path, status, error_message)
-metadata_cache(query_hash, payload_json, fetched_at)   -- MB-Rate-Limit schonen
-audit_log(id, ts, username, action, detail)
-```
-
-`sha256` dient der Duplikaterkennung und dem Wiederaufsetzen nach Abbruch.
-
----
-
-### 6. Sicherheit
-
-**Login gegen Navidrome**
-Eigener `AuthenticationProvider`, der `GET /rest/ping.view` mit Token-Auth aufruft:
-`u=<user>&t=md5(password+salt)&s=<zufälliges salt>&v=1.16.1&c=navidrome-uploader&f=json`
-Bei `status="ok"` folgt `getUser.view` → `adminRole` bestimmt, ob `ROLE_ADMIN` (darf hochladen) oder `ROLE_USER` (darf nur suchen).
-
-**Wichtig:** `startScan` verlangt in aktuellen Navidrome-Versionen Admin-Rechte. Entweder du erlaubst Upload nur Admins, oder du hinterlegst einen Service-Account in der Config nur für den Scan-Trigger.
-
-Weitere Punkte:
-- Passwort nicht persistieren; für Folge-Calls entweder pro Request neu anfordern oder verschlüsselt in der Server-Session halten
-- CSRF aktiv lassen (HTMX sendet den Token per `hx-headers`)
-- `spring.servlet.multipart.max-file-size` / `max-request-size` setzen, sonst OOM-Risiko
-- Zielpfad strikt sanitizen (Path Traversal über Tag-Werte wie `../` ist ein realer Angriffsvektor)
-- SFTP: dedizierter User + Public-Key-Auth, **kein** `StrictHostKeyChecking=no` — Host-Key im known_hosts der App pinnen
-- App nur hinter TLS (Caddy/nginx als Reverse Proxy)
-
----
-
-### 7. Vorbereitung auf dem Ubuntu-Server
-
-```bash
-sudo adduser --system --group nd-uploader
-sudo usermod -aG navidrome nd-uploader
-sudo mkdir -p /srv/music/.incoming
-sudo chown -R :navidrome /srv/music
-sudo chmod -R g+rws /srv/music          # setgid: neue Dateien erben die Gruppe
-# SSH-Key der App in /home/nd-uploader/.ssh/authorized_keys
-```
-
-Optional in der Navidrome-Config `ScanSchedule` deaktivieren, wenn nur noch die App Scans auslöst.
-
----
-
-### 8. Umsetzung in Meilensteinen
-
-| M | Inhalt | Ergebnis | Aufwand |
-|---|---|---|---|
-| **M0** | Projekt-Skeleton, Flyway, Actuator, Docker/systemd | App startet, `/actuator/health` grün | 0,5 d |
-| **M1** | `NavidromeClient` + Login | Login gegen echten Server funktioniert, Rollen gemappt | 1 d |
-| **M2** | Dashboard-Shell (Thymeleaf, HTMX, Layout, Navigation) | Eingeloggte Startseite | 0,5 d |
-| **M3** | MusicBrainz-Suche + Cover + Rate-Limiting + Cache | Suchen, Release öffnen, Tracklist sehen | 1,5 d |
-| **M4** | Bibliotheks-Abgleich via `search3` | „vorhanden/fehlt"-Badges | 0,5 d |
-| **M5** | Upload + Validierung + Tag-Mapping-UI | Dateien liegen im Staging der App, Tags korrekt | 2 d |
-| **M6** | SFTP-Transfer, Staging, atomares Rename, Kollisionslogik | Datei landet korrekt in der Library | 1,5 d |
-| **M7** | Job-Queue, Worker, Retry, Historie, Scan-Trigger + Polling | Vollständiger Flow inkl. UI-Status | 1,5 d |
-| **M8** | Härtung: Tests (Testcontainers/WireMock), Logging, Audit, Deployment | Produktionsreif | 1,5 d |
-
-Realistisch **10–11 Personentage**. M0–M2 ergeben schon einen sinnvollen Zwischenstand zum Anschauen.
-
----
-
-### 9. Risiken
-
-| Risiko | Gegenmaßnahme |
+| Thema | Entscheidung |
 |---|---|
-| Navidrome indexiert halb übertragene Dateien | Staging in `.incoming` + Rename im selben Dateisystem |
-| MusicBrainz sperrt bei zu vielen Requests | RateLimiter 1 rps, Cache, korrekter User-Agent mit Kontakt |
-| Falsche Dateirechte → Navidrome kann nicht lesen | setgid-Bit + umask beim SFTP-User, nach Transfer `chmod` setzen |
-| Subsonic-Token-Auth erfordert reversibel gespeicherte Passwörter in Navidrome | vorab an einem Testuser verifizieren; Fallback: Passwort-Parameter über HTTPS |
-| Große Uploads blockieren Request-Threads | Streaming auf Platte, dann asynchroner Worker |
-| SSH-Verbindung bricht mitten im Transfer | Job resumable über `sha256` + Status pro Datei |
+| Quelle | Soulseek, via **slskd** (Daemon mit REST-API + SignalR) |
+| Topologie | **Alles auf demselben Ubuntu-Server**: slskd, Spring-Boot-App, Navidrome |
+| Dateitransfer | Kein SSH/SFTP — direkter Dateisystemzugriff, Import per `move` innerhalb desselben Mounts |
+| Trefferauswahl | **Automatisch nach Regeln** (Scoring), mit Fallback auf den nächstbesten Treffer |
+| MVP-Umfang | Persistente Job-Queue (DB), Retry, Job-Historie, Live-Status via HTMX, MusicBrainz-Tagging + Cover |
+| Frontend | Thymeleaf + HTMX, mobil-first, als PWA installierbar |
+| Login | Durchgereicht an Navidrome (keine eigene Benutzerverwaltung) |
+
+> Damit entfällt die frühere Annahme „App auf separatem Host, Transfer per SFTP". Das vereinfacht Fehlerbehandlung, Rechte und Performance erheblich.
 
 ---
 
-### 10. Noch offene Punkte für die Umsetzung
+## 3. Rechtlicher Rahmen
 
-1. **Namensschema** — Vorschlag: `AlbumArtist/Album (Jahr)/01 - Titel.flac`. Passt das zu deiner bestehenden Struktur? (Wichtig: das Schema muss zur schon vorhandenen Bibliothek passen.)
-2. **Erlaubte Formate** — nur FLAC/MP3/M4A, oder alles? Soll die App Nicht-Audio blockieren?
-3. **DB** — H2-Datei reicht, oder hast du schon einen Postgres laufen?
-4. **Mehrere Nutzer** oder nur du? Das entscheidet, wie streng die Job-Isolation sein muss.
-5. **ZIP-/Ordner-Upload** gewünscht, oder reicht Mehrfachauswahl von Einzeldateien?
+slskd und das Soulseek-Protokoll sind legitime Open-Source-Software; das Netz wird jedoch überwiegend zum Austausch urheberrechtlich geschützter Aufnahmen genutzt. Downloads erfolgen auf eigene Verantwortung, und je nach Rechtslage kann auch das automatische Weiter-Teilen (Upload-Slots) relevant sein. Die Architektur kapselt die Quelle deshalb hinter einem `SourceProvider`-Interface — slskd ist eine Implementierung, weitere (Jamendo, Internet Archive, eigene Nextcloud/S3, Direkt-URL) lassen sich ohne Änderung der Kernlogik ergänzen.
 
-Sag mir zu 1–3 kurz was, dann kann ich direkt mit M0 anfangen und das Skeleton bauen. Wenn du den Plan als lebendes Dokument willst, mach ich daraus ein Doc, an dem wir während der Umsetzung weiterarbeiten.
+---
 
-Sources: [Navidrome Subsonic API Compatibility](https://www.navidrome.org/docs/developers/subsonic-api/), [Spring Boot EOL / Versionen](https://endoflife.date/spring-boot), [Navidrome PR #5510 – Admin-Middleware für Subsonic-Management-Endpoints](https://github.com/navidrome/navidrome/pull/5510)
+## 4. Requirements
+
+### 4.1 Funktionale Anforderungen
+
+| ID | Anforderung | Prio |
+|---|---|---|
+| FR-1 | Nutzer meldet sich mit seinen **Navidrome-Zugangsdaten** an; Validierung gegen die Navidrome-API | MUSS |
+| FR-2 | Suchfeld für Freitext (`Artist – Album` oder `Artist – Track`); optional Modus „Album" / „Track" | MUSS |
+| FR-3 | App fragt **MusicBrainz** ab, um die Eingabe zu einem kanonischen Release/Recording aufzulösen (Artist, Albumtitel, Tracklist, Jahr, MBIDs) | MUSS |
+| FR-4 | App prüft vor dem Download, ob das Release **bereits in Navidrome existiert** (Duplikatschutz) | MUSS |
+| FR-5 | App startet eine Soulseek-Suche über slskd und sammelt Treffer über ein Zeitfenster (z. B. 15 s) | MUSS |
+| FR-6 | **Automatisches Scoring** der Treffer (Format, Bitrate, Vollständigkeit, freie Slots, Queue-Länge, Namensähnlichkeit); bester Kandidat wird gewählt | MUSS |
+| FR-7 | Bei Fehlschlag/Timeout automatischer Fallback auf den nächstbesten Kandidaten (max. N Versuche) | MUSS |
+| FR-8 | Jobs werden **persistent** gespeichert; Neustart der App verliert keinen Job | MUSS |
+| FR-9 | Dashboard zeigt alle Jobs mit Status, Fortschritt (%), Geschwindigkeit, Fehlermeldung; Aktualisierung ohne Reload | MUSS |
+| FR-10 | Heruntergeladene Dateien werden **getaggt** (ID3v2.4 / Vorbis) aus MusicBrainz-Daten und mit Cover aus dem Cover Art Archive versehen | MUSS |
+| FR-11 | Ablage nach Schema `<library>/<AlbumArtist>/<Jahr> - <Album>/<NN> - <Titel>.<ext>` | MUSS |
+| FR-12 | Nach erfolgreichem Import wird ein **Navidrome-Scan** angestoßen | MUSS |
+| FR-13 | Job manuell abbrechen, wiederholen (Retry) und löschen | MUSS |
+| FR-14 | Job-Historie mit Filter (Status, Zeitraum) und Detailansicht inkl. Log | SOLL |
+| FR-15 | Optionaler Upload eigener Dateien über dasselbe Dashboard (gleiche Import-Pipeline) | SOLL |
+| FR-16 | Als PWA installierbar, Startbildschirm-Icon, funktioniert auf Mobilgeräten | SOLL |
+| FR-17 | Einstellungsseite: Formatpräferenz, Mindest-Bitrate, Suchfenster, Scan-Trigger an/aus | SOLL |
+| FR-18 | Watchlist: fehlgeschlagene Suchen periodisch erneut versuchen | KANN |
+
+### 4.2 Nicht-funktionale Anforderungen
+
+| ID | Anforderung |
+|---|---|
+| NFR-1 | **Sicherheit**: nur die App ist von außen erreichbar (Reverse Proxy + TLS); slskd-Web-UI und Navidrome-Port bleiben auf `127.0.0.1` |
+| NFR-2 | Keine Passwörter im Klartext persistieren; slskd-API-Key und Navidrome-URL aus Environment/`.env`, nie im Repo |
+| NFR-3 | **Dateirechte**: Import erzeugt Dateien mit `0644`/Verzeichnisse `0755`, Eigentümer-Gruppe = Navidrome-Gruppe |
+| NFR-4 | Import ist **atomar**: erst in temporäres Verzeichnis auf demselben Dateisystem, dann `rename` an den Zielpfad |
+| NFR-5 | **Idempotenz**: ein wiederholter Job für dasselbe Release darf keine Duplikate erzeugen |
+| NFR-6 | MusicBrainz-Rate-Limit einhalten (max. 1 Request/s, aussagekräftiger User-Agent) |
+| NFR-7 | Ressourcen: läuft zusammen mit Navidrome auf kleiner Hardware — Heap-Limit gesetzt, keine In-Memory-Pufferung ganzer Dateien |
+| NFR-8 | Beobachtbarkeit: strukturierte Logs, `/actuator/health`, Metriken für Job-Durchsatz und Fehlerquote |
+| NFR-9 | Testbarkeit: slskd und Navidrome in Tests gemockt (WireMock), DB via Testcontainers |
+| NFR-10 | Ein einziger App-Prozess; keine verteilte Koordination nötig, aber Queue-Zugriff trotzdem mit `SELECT … FOR UPDATE SKIP LOCKED` |
+
+---
+
+## 5. Architektur
+
+### 5.1 Komponenten auf dem Ubuntu-Server
+
+```
+                    ┌──────────────── Ubuntu Server ────────────────┐
+  Smartphone  ──►   │  Caddy/nginx  :443  (TLS, Auth-Proxy optional)│
+   Browser          │        │                                      │
+                    │        ▼                                      │
+                    │  music-uploader (Spring Boot)  :8080          │
+                    │     │            │              │             │
+                    │     │ REST       │ Subsonic API │ Filesystem  │
+                    │     ▼            ▼              ▼             │
+                    │  slskd :5030   Navidrome :4533   /srv/music   │
+                    │     │                              ▲          │
+                    │     └── /srv/slskd/downloads ───────┘ (move)  │
+                    │                                               │
+                    │  extern: MusicBrainz WS/2, Cover Art Archive  │
+                    └───────────────────────────────────────────────┘
+```
+
+Wichtig: `/srv/slskd/downloads` und `/srv/music` liegen **auf demselben Dateisystem**, damit der Import ein reines `rename()` ist (atomar, keine Kopie, kein halbfertiger Track im Scan).
+
+### 5.2 Paketstruktur (Java)
+
+```
+de.nico.musicuploader
+├── MusicUploaderApplication.java
+├── config/            SecurityConfig, RestClientConfig, AsyncConfig, AppProperties
+├── web/
+│   ├── controller/    DashboardController, SearchController, JobController, SettingsController
+│   ├── dto/           SearchFormDto, JobViewDto, CandidateViewDto
+│   └── fragment/      (Thymeleaf-Fragmente für HTMX-Teilrenderings)
+├── domain/
+│   ├── job/           DownloadJob, JobItem, JobStatus, JobEvent, Repositories
+│   └── settings/      AppSetting, SettingsService
+├── source/            SourceProvider (Interface), Candidate, SearchQuery
+│   └── slskd/         SlskdClient, SlskdSourceProvider, SlskdProperties, dto/
+├── metadata/          MusicBrainzClient, CoverArtClient, ReleaseMetadata, TagWriter
+├── library/           LibraryPathResolver, ImportService, DuplicateDetector, FilePermissions
+├── navidrome/         NavidromeClient (Subsonic), NavidromeAuthenticator, ScanTrigger
+├── orchestration/     JobQueueService, JobWorker, CandidateScorer, RetryPolicy
+└── support/           Slugify, Fuzzy (Levenshtein/Jaro), AudioFileFilter
+```
+
+### 5.3 Technologie-Stack
+
+| Ebene | Wahl | Begründung |
+|---|---|---|
+| Java | 21 (LTS) | Virtual Threads für die vielen blockierenden HTTP-/IO-Warteschleifen |
+| Framework | Spring Boot 3.5.x | aktuell, Support für Java 21, `RestClient` |
+| Build | Gradle (Kotlin DSL) | schnelle inkrementelle Builds; Maven ebenso möglich |
+| Web | Spring MVC + Thymeleaf + HTMX 2 | serverseitiges Rendering, kein JS-Buildstep |
+| Security | Spring Security, Form-Login mit eigenem `AuthenticationProvider` gegen Navidrome | FR-1 |
+| Persistenz | Spring Data JPA + **PostgreSQL 16** (Docker) | robuste `SKIP LOCKED`-Queue; H2-File als Leichtgewicht-Alternative |
+| Migration | Flyway | versionierte Schema-Änderungen |
+| HTTP-Client | `RestClient` + Resilience4j (Retry, CircuitBreaker, RateLimiter) | NFR-6 |
+| Tagging | **jaudiotagger** (FLAC/MP3/OGG) — ffmpeg als Fallback | Cover + Tags einbetten |
+| Async | `@Async` mit Virtual-Thread-Executor + `@Scheduled`-Poller | einfache, transparente Queue |
+| Live-Update | HTMX `hx-trigger="every 2s"` auf ein Fragment; später SSE | robust hinter Reverse Proxy |
+| Tests | JUnit 5, Testcontainers (Postgres), WireMock (slskd/Navidrome/MusicBrainz) | NFR-9 |
+| Deployment | Docker Compose (App + Postgres) neben bestehendem slskd/Navidrome, oder systemd-Unit mit Fat-JAR | Wahl nach bestehendem Setup |
+
+---
+
+## 6. Datenmodell
+
+```
+download_job
+  id              uuid        PK
+  created_at      timestamptz
+  updated_at      timestamptz
+  created_by      text            -- Navidrome-Username
+  query_raw       text            -- was der Nutzer eingegeben hat
+  mode            text            -- ALBUM | TRACK
+  mb_release_id   text null       -- MusicBrainz Release-MBID
+  mb_artist_id    text null
+  artist          text
+  album           text null
+  title           text null
+  year            int null
+  status          text            -- siehe Statusmaschine
+  attempt         int  default 0
+  max_attempts    int  default 3
+  error_message   text null
+  target_path     text null       -- finaler Ordner in der Library
+  finished_at     timestamptz null
+
+job_item                            -- eine Datei innerhalb eines Jobs
+  id              uuid        PK
+  job_id          uuid        FK -> download_job
+  track_number    int null
+  track_title     text null
+  source_user     text            -- Soulseek-Peer
+  source_filename text            -- Remote-Pfad
+  size_bytes      bigint
+  bitrate         int null
+  format          text            -- FLAC | MP3 | OGG | …
+  status          text
+  bytes_done      bigint default 0
+  local_path      text null       -- Pfad im slskd-Downloadordner
+  slskd_transfer_id text null
+
+job_event                           -- Audit-/Log-Trail pro Job
+  id              bigserial   PK
+  job_id          uuid        FK
+  at              timestamptz
+  level           text            -- INFO | WARN | ERROR
+  message         text
+
+candidate                           -- verworfene und gewählte Treffer, für Fallback + Nachvollziehbarkeit
+  id              uuid        PK
+  job_id          uuid        FK
+  rank            int
+  username        text
+  score           numeric
+  file_count      int
+  total_bytes     bigint
+  avg_bitrate     int null
+  format          text
+  free_slots      bool
+  queue_length    int
+  upload_speed    bigint
+  payload         jsonb           -- vollständige slskd-Antwort
+  chosen          bool default false
+
+app_setting
+  key             text        PK
+  value           text
+```
+
+Indizes: `download_job(status, created_at)`, `job_item(job_id)`, `candidate(job_id, rank)`, Unique auf `download_job(mb_release_id)` für `status IN (IMPORTED, DONE)` (Duplikatschutz, FR-4/NFR-5).
+
+---
+
+## 7. Statusmaschine eines Jobs
+
+```
+QUEUED
+  └─► RESOLVING_METADATA      (MusicBrainz: Query → Release + Tracklist)
+        └─► DUPLICATE_CHECK   (Navidrome search3)
+              ├─► SKIPPED_DUPLICATE  (Endzustand)
+              └─► SEARCHING          (slskd-Suche, Sammelfenster)
+                    ├─► NO_RESULTS   (Endzustand / Watchlist)
+                    └─► DOWNLOADING  (bester Kandidat enqueued)
+                          ├─► DOWNLOAD_FAILED ─► SEARCHING (nächster Kandidat, attempt++)
+                          └─► IMPORTING        (Dateien verifizieren, in temp verschieben)
+                                └─► TAGGING    (Tags + Cover schreiben)
+                                      └─► PUBLISHING  (rename in Library, Rechte setzen)
+                                            └─► SCANNING (Navidrome-Scan anstoßen)
+                                                  └─► DONE
+Jeder Zustand ─► FAILED (bei erschöpften Versuchen)   |   ─► CANCELLED (durch Nutzer)
+```
+
+Regeln:
+- Retry nur aus `DOWNLOAD_FAILED`, `SEARCHING`, `SCANNING` — nie mitten im Dateisystem-Schreiben.
+- `attempt` zählt Kandidaten-Fallbacks, nicht Netzwerk-Retries (die macht Resilience4j intern).
+- Ein Worker hält einen Job per `SKIP LOCKED`; ein Watchdog setzt Jobs, die länger als X Minuten in einem Nicht-Endzustand hängen, auf `FAILED` zurück (Stale-Job-Recovery nach Crash).
+
+---
+
+## 8. Scoring der Soulseek-Treffer (FR-6)
+
+Für jeden Peer-Treffer (`candidate`) wird ein gewichteter Score berechnet. Startwerte, später über die Einstellungsseite justierbar:
+
+| Kriterium | Gewicht | Berechnung |
+|---|---|---|
+| Format | 30 | FLAC = 1,0 · MP3 ≥ 320 = 0,8 · MP3 ≥ 256 = 0,6 · MP3 ≥ 192 = 0,4 · darunter = 0,1 · exotisch = 0 |
+| Vollständigkeit (Album-Modus) | 25 | gefundene Tracks / erwartete Tracks laut MusicBrainz; unter 0,9 harter Malus |
+| Namensähnlichkeit | 15 | Jaro-Winkler von normalisiertem `Artist Album Track` gegen Dateipfad |
+| Freier Upload-Slot | 12 | `freeUploadSlots > 0` → 1,0, sonst 0,2 |
+| Queue-Länge | 8 | `1 / (1 + queueLength/10)` |
+| Upload-Geschwindigkeit | 6 | logarithmisch normalisiert |
+| Konsistenz | 4 | alle Dateien gleiches Format/gleicher Ordner → 1,0 |
+
+Harte Filter **vor** dem Scoring:
+- nur Audio-Endungen (`.flac .mp3 .m4a .ogg .opus .wav`), alles andere (`.cue`, `.log`, `.nfo`, `.jpg`) fließt nicht in die Bewertung ein, wird aber bei FLAC-Alben optional mitgeladen;
+- unplausible Dateigrößen (z. B. < 500 KB pro Track) verwerfen — typische Fake-/Werbedateien;
+- Mindest-Bitrate aus den Einstellungen.
+
+Die Top-N (z. B. 5) Kandidaten werden gespeichert, damit der Fallback bei Abbruch sofort greift, ohne neu zu suchen.
+
+---
+
+## 9. Integrationen im Detail
+
+### 9.1 slskd
+
+- Läuft als Docker-Container oder systemd-Dienst, Web-API auf `127.0.0.1:5030`.
+- Authentifizierung über **API-Key** (Header `X-API-Key`) — in slskd unter `web.authentication.api_keys` konfigurieren, an die App per Environment-Variable übergeben.
+- Ablauf: Suche starten → Ergebnisse pollen bzw. über den SignalR-Hub empfangen → Download für den gewählten Peer + Dateiliste einreihen → Transferstatus pollen bis `Completed`/`Errored`.
+- slskd legt fertige Dateien in seinem Download-Verzeichnis ab; die App liest dort und verschiebt in die Library.
+- **Vor der Implementierung**: die exakten Endpunktpfade gegen die laufende Instanz verifizieren (slskd bringt eine Swagger-/OpenAPI-Oberfläche mit). Der Adapter kapselt sie, sodass eine Abweichung nur `SlskdClient` betrifft.
+- Sinnvolle slskd-Einstellungen: eigenes Download-Verzeichnis, `remote_file_management` aus, Shares bewusst konfigurieren.
+
+### 9.2 Navidrome
+
+- **Login-Durchreichung (FR-1)**: eigener `AuthenticationProvider` ruft die Subsonic-Ping-Operation mit `u` + Salt/Token-Verfahren auf; HTTP 200 mit `status="ok"` ⇒ Anmeldung gültig. Das Navidrome-Passwort wird nur für diesen Aufruf gehalten und nicht persistiert; die Session merkt sich lediglich den Benutzernamen.
+- **Duplikatprüfung (FR-4)**: Subsonic-Suche (`search3`) nach Artist + Album; zusätzlich Abgleich über die MusicBrainz-ID, falls Navidrome sie liefert.
+- **Scan-Trigger (FR-12)**: Subsonic-Operation `startScan`, Fortschritt über `getScanStatus`. Alternativ auf Navidromes eigenen Datei-Watcher verlassen und den Trigger in den Einstellungen abschaltbar machen.
+- Schreibrechte: die App muss in die Library schreiben dürfen — dedizierter Systembenutzer `musicuploader` in der Gruppe von Navidrome, Library-Verzeichnis `g+ws`.
+
+### 9.3 MusicBrainz / Cover Art Archive
+
+- Aufruf mit eigenem User-Agent (`music-uploader/1.0 ( kontakt )`), Rate-Limiter auf 1 Request/s, Ergebnisse in der DB cachen.
+- Release-Auswahl: bevorzugt offizielle Alben, primärer Release-Typ, passendes Land/Jahr; die Tracklist liefert die Soll-Struktur für Vollständigkeitsprüfung und Dateinamen.
+- Cover in bis zu 1000 px laden, in die Dateien einbetten **und** zusätzlich als `cover.jpg` im Albumordner ablegen (Navidrome nutzt beides).
+
+---
+
+## 10. Import-Pipeline
+
+1. **Verifizieren** — Datei existiert, Größe stimmt mit dem angekündigten Wert überein, Audio-Header lesbar.
+2. **In Arbeitsverzeichnis verschieben** — `/srv/music/.incoming/<jobId>/` (auf demselben Dateisystem wie die Library, damit alles `rename` bleibt).
+3. **Tracks zuordnen** — Dateireihenfolge gegen die MusicBrainz-Tracklist matchen (Tracknummer aus Dateinamen, sonst Titelähnlichkeit, sonst Sortierreihenfolge).
+4. **Taggen** — Artist, AlbumArtist, Album, Titel, Tracknummer/-gesamt, Discnummer, Jahr, Genre, MBIDs; Cover einbetten.
+5. **Umbenennen** — `<AlbumArtist>/<Jahr> - <Album>/<NN> - <Titel>.<ext>`, Sonderzeichen ersetzen, Länge auf 255 Bytes begrenzen, Unicode-Normalisierung NFC.
+6. **Rechte setzen** — Dateien `0644`, Ordner `0755`, Gruppe = Navidrome-Gruppe.
+7. **Veröffentlichen** — Albumordner per `rename` an den Zielpfad; existiert er bereits, Kollisionsstrategie aus den Einstellungen (überspringen / `(2)` anhängen / ersetzen).
+8. **Aufräumen** — Arbeitsverzeichnis löschen, slskd-Downloadordner leeren.
+9. **Scan anstoßen** und Job auf `DONE` setzen.
+
+Fehler in Schritt 4–7 rollen das Arbeitsverzeichnis zurück; die Library wird nie in einem Zwischenzustand sichtbar.
+
+---
+
+## 11. UI / Dashboard
+
+| Seite | Inhalt |
+|---|---|
+| `/login` | Navidrome-Benutzername + Passwort |
+| `/` | Großes Suchfeld (mobil-first), darunter „Aktive Jobs" als HTMX-Fragment mit Auto-Refresh |
+| `/search` | Auflösung der Eingabe über MusicBrainz: Trefferliste mit Cover, Artist, Album, Jahr, Trackzahl → Button „Auf Server laden" |
+| `/jobs` | Historie mit Statusfilter, Suche, Paginierung |
+| `/jobs/{id}` | Detail: Kandidaten mit Score, Dateiliste, Fortschritt, Event-Log, Aktionen (Abbrechen, Retry, Löschen) |
+| `/settings` | Formatpräferenz, Mindest-Bitrate, Suchfenster, max. Kandidaten, Scan-Trigger, Kollisionsstrategie, Pfade |
+| `/upload` | Optionaler Datei-Upload (FR-15), landet in derselben Pipeline |
+
+HTMX-Muster: Fortschrittstabelle als eigenes Fragment, das per `hx-get="/jobs/active" hx-trigger="every 2s"` aktualisiert wird — kein JS-Framework, funktioniert zuverlässig auf Mobilfunk. PWA-Manifest + Service Worker nur fürs Icon und einen Offline-Hinweis; keine Offline-Funktionalität nötig.
+
+---
+
+## 12. Umsetzungsphasen
+
+### Phase 0 — Server-Inventur (½ Tag)
+- Navidrome-Version, Library-Pfad, Benutzer/Gruppe, Datei-Watcher an/aus prüfen.
+- slskd installieren bzw. Version prüfen, API-Key anlegen, Download-Verzeichnis auf dasselbe Dateisystem wie die Library legen.
+- Manueller Rauchtest: Suche und Download über die slskd-Web-UI, Datei per Hand in die Library legen, Scan auslösen. **Erst wenn das von Hand funktioniert, lohnt Code.**
+- Endpunkte von slskd und Navidrome per `curl` dokumentieren → Grundlage für die Adapter.
+
+### Phase 1 — Projekt-Setup (½ Tag)
+- Spring Initializr: Web, Thymeleaf, Security, Data JPA, Validation, Flyway, Actuator, Testcontainers.
+- Git-Repo, `.gitignore`, `application.yml` + `application-local.yml`, Secrets ausschließlich über Environment.
+- Docker Compose: App + Postgres; Healthchecks.
+- CI (GitHub Actions oder lokal): Build + Tests.
+- **Ergebnis**: „Hello Dashboard" läuft unter `:8080`.
+
+### Phase 2 — Auth + Navidrome-Adapter (1 Tag)
+- `NavidromeClient` (Ping, search3, startScan, getScanStatus) mit WireMock-Tests.
+- `AuthenticationProvider` gegen Navidrome, Form-Login, Session, CSRF.
+- **Ergebnis**: Login mit Navidrome-Account funktioniert, Scan lässt sich per Button auslösen.
+
+### Phase 3 — Metadaten (1 Tag)
+- `MusicBrainzClient` mit Rate-Limiter + Cache, `CoverArtClient`.
+- Such-Seite: Eingabe → Release-Kandidaten mit Cover.
+- **Ergebnis**: Ein Album lässt sich eindeutig auflösen; Tracklist liegt vor.
+
+### Phase 4 — slskd-Adapter (1–2 Tage)
+- `SlskdClient`: Suche starten, Ergebnisse einsammeln, Download einreihen, Transferstatus abfragen, Transfer abbrechen.
+- `CandidateScorer` inkl. Unit-Tests mit echten, abgespeicherten Antwort-Payloads.
+- **Ergebnis**: Konsolennah (Integrationstest) lässt sich ein Album auf die Platte holen.
+
+### Phase 5 — Job-Queue + Orchestrierung (1–2 Tage)
+- Flyway-Migrationen, Entities, Repositories.
+- `JobQueueService` (`SKIP LOCKED`), `JobWorker` mit der Statusmaschine, Retry-/Fallback-Logik, Stale-Job-Watchdog.
+- **Ergebnis**: Job überlebt Neustart, läuft bis `DOWNLOADING` durch.
+
+### Phase 6 — Import-Pipeline (1–2 Tage)
+- Verifikation, Track-Matching, `TagWriter`, `LibraryPathResolver`, Rechte, atomares `rename`, Kollisionsstrategie, Cleanup.
+- Tests auf einem temporären Verzeichnisbaum (kein Mock-Dateisystem — echte Semantik von `rename` und Rechten ist der Punkt).
+- **Ergebnis**: Ein Job läuft vollständig bis `DONE`, das Album taucht in Navidrome korrekt getaggt auf.
+
+### Phase 7 — UI ausbauen (1–2 Tage)
+- Dashboard, Job-Detail mit Event-Log, Historie mit Filter, Einstellungsseite, HTMX-Polling, mobiles Layout, PWA-Manifest.
+- **Ergebnis**: vom Smartphone bedienbar, Status live sichtbar.
+
+### Phase 8 — Härtung & Deployment (1 Tag)
+- Reverse Proxy mit TLS, Rate-Limit auf `/login`, Ports von slskd/Navidrome auf localhost binden.
+- systemd-Unit bzw. Compose-Service mit Restart-Policy, Logrotation, Backup der Postgres-DB.
+- Actuator-Health, Metriken, Alarm bei Fehlerquote.
+- Runbook: Was tun, wenn ein Job hängt / slskd offline ist / die Library voll ist.
+
+### Phase 9 — Optional
+Watchlist für erfolglose Suchen · Duplikaterkennung über akustische Fingerprints (AcoustID) · zweiter `SourceProvider` (Internet Archive, eigene Nextcloud) · Album-Batch aus einer Wunschliste · Web-Push bei fertigem Job.
+
+**Grobe Gesamtdauer**: rund 8–12 Arbeitstage bis zu einer belastbaren Version; das lauffähige Skelett (Phase 1–5) steht typischerweise nach 4–5 Tagen.
+
+---
+
+## 13. Risiken & Gegenmaßnahmen
+
+| Risiko | Auswirkung | Gegenmaßnahme |
+|---|---|---|
+| Soulseek-Peer geht offline / Queue ewig lang | Job hängt | Timeout pro Kandidat, automatischer Fallback auf Rang 2–5, Watchdog |
+| Falsch benannte oder gefälschte Dateien | Müll in der Library | Harte Filter, Größen-Plausibilität, Header-Prüfung, Vollständigkeitsabgleich gegen MusicBrainz |
+| slskd-API ändert sich zwischen Versionen | Adapter bricht | Alles in `SlskdClient` gekapselt, Contract-Tests mit gespeicherten Payloads, slskd-Version pinnen |
+| MusicBrainz-Rate-Limit / Ausfall | Jobs stocken | Rate-Limiter, Cache, Degradationspfad: ohne Metadaten importieren und Tagging später nachholen |
+| Navidrome scannt halbfertige Dateien | Kaputte Einträge | Import ausschließlich per `rename` aus `.incoming/` auf demselben Dateisystem |
+| Dateirechte falsch | Navidrome sieht nichts | Fester umask im Service, Rechte im Import explizit setzen, Smoke-Test im Runbook |
+| Dashboard öffentlich erreichbar | Fremdzugriff | Navidrome-Login erzwungen, TLS, Login-Rate-Limit, optional zusätzlich VPN/Tailscale statt Portfreigabe |
+| Platte läuft voll | Import schlägt mitten drin fehl | Vor dem Enqueue freien Speicher prüfen, Schwellwert-Warnung im Dashboard |
+
+---
+
+## 14. Nächste konkrete Schritte
+
+1. Phase 0 durchziehen: slskd-Version, API-Key, Pfade, Navidrome-Version und Library-Pfad festhalten — und einmal **von Hand** ein Album durchschleusen.
+2. Die tatsächlichen slskd-Endpunkte per `curl` mitschneiden und als Testfixtures ablegen.
+3. Entscheidung Postgres vs. H2-File treffen (Postgres empfohlen, wenn ohnehin Docker läuft).
+4. Repository anlegen und mit Phase 1 starten.
+
+Wenn Phase 0 steht, kann ich das Projektgerüst inklusive Adapter, Flyway-Migrationen und Statusmaschine direkt ausbauen.
