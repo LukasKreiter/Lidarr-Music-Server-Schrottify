@@ -56,8 +56,9 @@ slskd und das Soulseek-Protokoll sind legitime Open-Source-Software; das Netz wi
 | FR-14 | Job-Historie mit Filter (Status, Zeitraum) und Detailansicht inkl. Log | SOLL |
 | FR-15 | Optionaler Upload eigener Dateien über dasselbe Dashboard (gleiche Import-Pipeline) | SOLL |
 | FR-16 | Als PWA installierbar, Startbildschirm-Icon, funktioniert auf Mobilgeräten | SOLL |
-| FR-17 | Einstellungsseite: Formatpräferenz, Mindest-Bitrate, Suchfenster, Scan-Trigger an/aus | SOLL |
-| FR-18 | Watchlist: fehlgeschlagene Suchen periodisch erneut versuchen | KANN |
+| FR-17 | Lyrics durch .LRC Dateien | SOLL |
+| FR-18 | Einstellungsseite: Formatpräferenz, Mindest-Bitrate, Suchfenster, Scan-Trigger an/aus | SOLL |
+| FR-19 | Watchlist: fehlgeschlagene Suchen periodisch erneut versuchen | KANN |
 
 ### 4.2 Nicht-funktionale Anforderungen
 
